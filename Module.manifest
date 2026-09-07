@@ -1,0 +1,2 @@
+EXCLUDE FROM GHIDRA JAR: true
+MODULE FILE LICENSE: third_party/luau/LICENSE.txt MIT

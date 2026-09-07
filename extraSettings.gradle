@@ -1,0 +1,2 @@
+// Applied by ../ghidra/settings.gradle when ../ghidra/ghidra.repos.config contains "LuaGhidra".
+includeProject('LuaGhidra', '..', true)

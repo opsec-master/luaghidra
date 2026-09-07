@@ -1,0 +1,23 @@
+##VERSION: 2.0
+##MODULE IP: Apache License 2.0
+.gitignore||GHIDRA||||END|
+.gitmodules||GHIDRA||||END|
+Module.manifest||GHIDRA||||END|
+README.md||GHIDRA||||END|
+build.gradle||GHIDRA||||END|
+extension.properties||GHIDRA||||END|
+extraSettings.gradle||GHIDRA||||END|
+settings.gradle||GHIDRA||||END|
+src/main/java/luaghidra/LuaEvalResult.java||GHIDRA||||END|
+src/main/java/luaghidra/LuaEvalStatus.java||GHIDRA||||END|
+src/main/java/luaghidra/LuaGhidraPlugin.java||GHIDRA||||END|
+src/main/java/luaghidra/LuauNativeBridge.java||GHIDRA||||END|
+src/main/java/luaghidra/bridge/JavaBridge.java||GHIDRA||||END|
+src/main/java/luaghidra/console/LuaConsole.java||GHIDRA||||END|
+src/main/java/luaghidra/console/LuaGhidraInterpreter.java||GHIDRA||||END|
+src/main/java/luaghidra/console/ResetAction.java||GHIDRA||||END|
+src/main/native/CMakeLists.txt||GHIDRA||||END|
+src/main/native/java_bridge.cpp||GHIDRA||||END|
+src/main/native/java_bridge.h||GHIDRA||||END|
+src/main/native/luaghidra_jni.cpp||GHIDRA||||END|
+third_party/README.md||GHIDRA||||END|

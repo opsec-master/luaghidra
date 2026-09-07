@@ -1,0 +1,365 @@
+import org.gradle.internal.os.OperatingSystem
+
+plugins {
+	id 'java-library'
+	id 'eclipse'
+}
+
+defaultTasks 'buildExtension'
+
+def isGhidraSourceBuild =
+	file("${rootProject.projectDir}/gradle/distributableGhidraExtension.gradle").exists()
+def ghidraInstallDir = findProperty('GHIDRA_INSTALL_DIR') ?: System.getenv('GHIDRA_INSTALL_DIR')
+
+if (isGhidraSourceBuild) {
+	apply from: "${rootProject.projectDir}/gradle/distributableGhidraExtension.gradle"
+	apply from: "${rootProject.projectDir}/gradle/javaProject.gradle"
+	apply from: "${rootProject.projectDir}/gradle/helpProject.gradle"
+	apply from: "${rootProject.projectDir}/gradle/javaTestProject.gradle"
+
+	dependencies {
+		api project(':Base')
+	}
+}
+else if (ghidraInstallDir) {
+	task distributeExtension {
+		group = 'Ghidra'
+
+		apply from: new File(ghidraInstallDir).getCanonicalPath() + '/support/buildExtension.gradle'
+		dependsOn ':buildExtension'
+	}
+}
+else {
+	tasks.register('buildExtension') {
+		group = 'Ghidra'
+		description = 'Builds the Ghidra extension zip.'
+
+		doFirst {
+			throw new GradleException(
+				'GHIDRA_INSTALL_DIR is not defined. Set it to a built Ghidra installation, ' +
+				'or add "LuaGhidra" to ../ghidra/ghidra.repos.config and build from the Ghidra source tree.'
+			)
+		}
+	}
+}
+
+eclipse.project.name = 'Xtra LuaGhidra'
+
+plugins.withType(JavaPlugin) {
+	java {
+		toolchain {
+			languageVersion = JavaLanguageVersion.of(21)
+		}
+	}
+}
+
+// Cross-building: `nativePlatform` names the Ghidra os/<platform> directory the
+// bridge is staged into, `cmakeGenerator` and `cmakeArgs` (';'-separated) reach
+// both CMake configure steps. CI sets all three; a local build needs none.
+def nativePlatform = (findProperty('nativePlatform') ?: currentGhidraPlatform()).toString()
+def cmakeGenerator = (findProperty('cmakeGenerator') ?: 'Ninja').toString()
+def cmakeExtraArgs = ((findProperty('cmakeArgs') ?: '') as String).split(';').findAll { !it.isEmpty() }
+
+def luauSourceDir = layout.projectDirectory.dir('third_party/luau')
+def luauBuildDir = layout.buildDirectory.dir("luau/${nativePlatform}")
+def luauArtifactDir = layout.buildDirectory.dir("luau-artifacts/${nativePlatform}")
+def bridgeBuildDir = layout.buildDirectory.dir("luaghidra-native/${nativePlatform}")
+def bridgeOutputDir = layout.projectDirectory.dir("os/${nativePlatform}")
+def tempGhidraSettingsBase = providers.gradleProperty('luaGhidraTempSettingsDir')
+	.map { file(it) }
+	.orElse(layout.buildDirectory.dir('tmp/runGhidraTemp/settings').map { it.asFile })
+def skipLuauNative = providers.gradleProperty('skipLuauNative').map { it.toBoolean() }.orElse(false)
+
+tasks.register('configureLuau', Exec) {
+	group = 'LuaGhidra'
+	description = 'Configure the Luau native runtime with CMake.'
+
+	onlyIf { !skipLuauNative.get() }
+	inputs.file luauSourceDir.file('CMakeLists.txt')
+	inputs.property 'cmakeGenerator', cmakeGenerator
+	inputs.property 'cmakeArgs', cmakeExtraArgs
+	outputs.dir luauBuildDir
+
+	executable = 'cmake'
+	args '-S', luauSourceDir.asFile.absolutePath,
+		'-B', luauBuildDir.get().asFile.absolutePath,
+		'-G', cmakeGenerator,
+		'-DCMAKE_BUILD_TYPE=Release',
+		'-DLUAU_BUILD_CLI=OFF',
+		'-DLUAU_BUILD_TESTS=OFF',
+		'-DLUAU_BUILD_SHARED=OFF',
+		'-DLUAU_EXTERN_C=ON',
+		'-DCMAKE_POSITION_INDEPENDENT_CODE=ON'
+	args cmakeExtraArgs
+}
+
+tasks.register('buildLuau', Exec) {
+	group = 'LuaGhidra'
+	description = 'Build the Luau native runtime.'
+
+	onlyIf { !skipLuauNative.get() }
+	dependsOn tasks.named('configureLuau')
+	inputs.dir luauSourceDir
+	outputs.dir luauBuildDir
+
+	executable = 'cmake'
+	args '--build', luauBuildDir.get().asFile.absolutePath, '--config', 'Release'
+}
+
+tasks.register('stageLuauNative', Copy) {
+	group = 'LuaGhidra'
+	description = 'Stage Luau static libraries for the native bridge build.'
+
+	onlyIf { !skipLuauNative.get() }
+	dependsOn tasks.named('buildLuau')
+	from(luauBuildDir) {
+		include '**/*.a'
+		include '**/*.lib'
+		eachFile { details ->
+			details.path = details.name
+		}
+		includeEmptyDirs = false
+	}
+	into luauArtifactDir.map { it.dir('lib') }
+}
+
+tasks.register('configureBridgeNative', Exec) {
+	group = 'LuaGhidra'
+	description = 'Configure the LuaGhidra JNI bridge with CMake.'
+
+	onlyIf { !skipLuauNative.get() }
+	dependsOn tasks.named('stageLuauNative')
+	inputs.file layout.projectDirectory.file('src/main/native/CMakeLists.txt')
+	inputs.dir layout.projectDirectory.dir('src/main/native')
+	inputs.dir luauArtifactDir
+	inputs.property 'cmakeGenerator', cmakeGenerator
+	inputs.property 'cmakeArgs', cmakeExtraArgs
+	outputs.dir bridgeBuildDir
+
+	executable = 'cmake'
+	args '-S', layout.projectDirectory.dir('src/main/native').asFile.absolutePath,
+		'-B', bridgeBuildDir.get().asFile.absolutePath,
+		'-G', cmakeGenerator,
+		'-DCMAKE_BUILD_TYPE=Release',
+		"-DLUAU_SOURCE_DIR=${luauSourceDir.asFile.absolutePath}",
+		"-DLUAU_ARTIFACT_DIR=${luauArtifactDir.get().asFile.absolutePath}"
+	args cmakeExtraArgs
+}
+
+tasks.register('buildBridgeNative', Exec) {
+	group = 'LuaGhidra'
+	description = 'Build the LuaGhidra JNI bridge shared library.'
+
+	onlyIf { !skipLuauNative.get() }
+	dependsOn tasks.named('configureBridgeNative')
+	inputs.dir layout.projectDirectory.dir('src/main/native')
+	inputs.dir luauArtifactDir
+	outputs.dir bridgeBuildDir
+
+	executable = 'cmake'
+	args '--build', bridgeBuildDir.get().asFile.absolutePath, '--config', 'Release'
+}
+
+tasks.register('stageBridgeNative', Copy) {
+	group = 'LuaGhidra'
+	description = 'Stage the LuaGhidra JNI bridge into Ghidra extension os/<platform> layout.'
+
+	onlyIf { !skipLuauNative.get() }
+	dependsOn tasks.named('buildBridgeNative')
+	from(bridgeBuildDir) {
+		include '**/*.dylib'
+		include '**/*.so'
+		include '**/*.dll'
+		eachFile { details ->
+			details.path = details.name
+		}
+		includeEmptyDirs = false
+	}
+	into bridgeOutputDir
+}
+
+tasks.matching { it.name in ['buildExtension', 'zipExtensions'] }.configureEach {
+	dependsOn tasks.named('stageBridgeNative')
+}
+
+// The Luau modules live inside the jar, where require() reads them. Jars cannot
+// be listed at runtime, so an index of module paths ships alongside them; the
+// editor setup uses it to extract the modules for luau-lsp.
+def luauModuleSource = layout.projectDirectory.dir('src/main/resources/luaghidra/modules')
+def luauIndexDir = layout.buildDirectory.dir('generated/luau-index')
+
+tasks.register('luauModuleIndex') {
+	group = 'LuaGhidra'
+	description = 'Writes an index of the bundled Luau modules.'
+
+	inputs.dir luauModuleSource
+	outputs.dir luauIndexDir
+
+	doLast {
+		def root = luauModuleSource.asFile
+		def paths = fileTree(root).files
+			.collect { root.toPath().relativize(it.toPath()).toString().replace(File.separator, '/') }
+			.sort()
+		def target = luauIndexDir.get().file('luaghidra/modules.index').asFile
+		target.parentFile.mkdirs()
+		target.text = paths.join('\n') + '\n'
+	}
+}
+
+sourceSets.main.resources.srcDir luauIndexDir
+tasks.named('processResources') { dependsOn tasks.named('luauModuleIndex') }
+
+tasks.withType(Zip).configureEach {
+	if (name in ['buildExtension', 'zipExtensions']) {
+		exclude '.git/**'
+		exclude '.gradle/**'
+		exclude '.vscode/**'
+		exclude 'third_party/**'
+		exclude 'src/test/**'
+		exclude 'gradle.properties'
+		exclude 'ghidra-luau-extension-design.md'
+	}
+}
+
+tasks.register('luaTest', JavaExec) {
+	group = 'LuaGhidra'
+	description = 'Runs the Luau test suite headlessly against the built JNI bridge.'
+
+	dependsOn tasks.named('stageBridgeNative'), tasks.named('testClasses')
+
+	mainClass = 'luaghidra.LuauTestRunner'
+	// Modules resolve from the classpath here, exactly as they do from the
+	// packaged extension jar.
+	classpath = sourceSets.test.runtimeClasspath
+	systemProperty 'luaghidra.library.path', bridgeOutputDir.asFile.absolutePath
+	args 'src/test/luau'
+}
+
+tasks.register('installGhidraTempExtension') {
+	group = 'LuaGhidra'
+	description = 'Build and install LuaGhidra into an isolated temporary Ghidra settings directory.'
+
+	dependsOn tasks.named('buildExtension')
+
+	doLast {
+		File installDir = requireGhidraInstallDir()
+		File ghidraRun = new File(installDir, OperatingSystem.current().isWindows() ? 'ghidraRun.bat' : 'ghidraRun')
+		if (!ghidraRun.isFile()) {
+			throw new GradleException("Ghidra launcher not found: ${ghidraRun}")
+		}
+
+		def buildExtensionTask = tasks.named('buildExtension').get()
+		if (!(buildExtensionTask instanceof Zip)) {
+			throw new GradleException('buildExtension is not a Zip task. Set GHIDRA_INSTALL_DIR to a built Ghidra installation before using runGhidraTemp.')
+		}
+
+		File settingsBase = tempGhidraSettingsBase.get()
+		File extensionsDir = getTempGhidraExtensionsDir(installDir, settingsBase)
+		File extensionDir = new File(extensionsDir, project.name)
+		File archiveFile = buildExtensionTask.archiveFile.get().asFile
+
+		delete extensionDir
+		copy {
+			from zipTree(archiveFile)
+			into extensionsDir
+		}
+
+		println "Installed ${archiveFile.name} into ${extensionsDir}"
+		println "Temporary Ghidra settings base: ${settingsBase}"
+	}
+}
+
+tasks.register('runGhidraTemp', Exec) {
+	group = 'LuaGhidra'
+	description = 'Launch Ghidra with LuaGhidra installed in an isolated temporary settings directory.'
+
+	dependsOn tasks.named('installGhidraTempExtension')
+
+	doFirst {
+		File installDir = requireGhidraInstallDir()
+		File settingsBase = tempGhidraSettingsBase.get()
+		File ghidraRun = new File(installDir, OperatingSystem.current().isWindows() ? 'ghidraRun.bat' : 'ghidraRun')
+		String existingOptions = System.getenv('GHIDRA_JAVA_OPTIONS') ?: ''
+		String settingsOption = "-Dapplication.settingsdir=${settingsBase.absolutePath}"
+		String javaOptions = existingOptions.isBlank() ? settingsOption : "${existingOptions} ${settingsOption}"
+
+		environment 'GHIDRA_JAVA_OPTIONS', javaOptions
+		commandLine ghidraRun.absolutePath
+
+		println "Launching ${ghidraRun}"
+		println "Using temporary settings base: ${settingsBase}"
+	}
+}
+
+tasks.register('cleanGhidraTemp') {
+	group = 'LuaGhidra'
+	description = 'Delete the isolated temporary Ghidra settings directory used by runGhidraTemp.'
+
+	doLast {
+		delete tempGhidraSettingsBase.get()
+	}
+}
+
+String currentGhidraPlatform() {
+	def os = OperatingSystem.current()
+	def arch = System.getProperty('os.arch').toLowerCase(Locale.ROOT)
+	def archName = arch in ['aarch64', 'arm64'] ? 'arm_64' : 'x86_64'
+
+	if (os.isMacOsX()) {
+		return "mac_${archName}"
+	}
+	if (os.isLinux()) {
+		return "linux_${archName}"
+	}
+	if (os.isWindows()) {
+		return "win_${archName}"
+	}
+
+	throw new GradleException("Unsupported OS for Ghidra native staging: ${System.getProperty('os.name')}")
+}
+
+File requireGhidraInstallDir() {
+	def configuredGhidraInstallDir = findProperty('GHIDRA_INSTALL_DIR') ?: System.getenv('GHIDRA_INSTALL_DIR')
+	if (!configuredGhidraInstallDir) {
+		throw new GradleException('GHIDRA_INSTALL_DIR is not defined. Set it in the environment or pass -PGHIDRA_INSTALL_DIR=/path/to/ghidra.')
+	}
+
+	File installDir = file(configuredGhidraInstallDir)
+	if (!installDir.isDirectory()) {
+		throw new GradleException("GHIDRA_INSTALL_DIR is not a directory: ${installDir}")
+	}
+	return installDir
+}
+
+File getTempGhidraExtensionsDir(File installDir, File settingsBase) {
+	Properties properties = new Properties()
+	File propertiesFile = new File(installDir, 'Ghidra/application.properties')
+	if (!propertiesFile.isFile()) {
+		throw new GradleException("Ghidra application.properties not found: ${propertiesFile}")
+	}
+	propertiesFile.withInputStream { properties.load(it) }
+
+	String appName = normalizeGhidraName(properties.getProperty('application.name'))
+	String appVersion = properties.getProperty('application.version')
+	String releaseName = normalizeGhidraName(properties.getProperty('application.release.name')).toUpperCase(Locale.ROOT)
+	if (!appName || !appVersion || !releaseName) {
+		throw new GradleException("Missing required Ghidra application properties in ${propertiesFile}")
+	}
+
+	File versionedSettingsDir = new File(settingsBase,
+		"${getGhidraUserSettingsAppDirName(settingsBase, appName)}/${appName}_${appVersion}_${releaseName}")
+	return new File(versionedSettingsDir, 'Extensions')
+}
+
+String normalizeGhidraName(String value) {
+	return value == null ? null : value.replaceAll('\\s', '').toLowerCase(Locale.ROOT)
+}
+
+String getGhidraUserSettingsAppDirName(File settingsBase, String appName) {
+	File userHome = new File(System.getProperty('user.home')).canonicalFile
+	File canonicalSettingsBase = settingsBase.canonicalFile
+	if (canonicalSettingsBase.toPath().startsWith(userHome.toPath())) {
+		return appName
+	}
+	return "${System.getProperty('user.name')}-${appName}"
+}

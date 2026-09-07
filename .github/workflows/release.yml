@@ -1,0 +1,185 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      ghidra_version:
+        description: Ghidra release to build the extension against
+        required: false
+        default: '12.1.2'
+
+env:
+  GHIDRA_VERSION: ${{ inputs.ghidra_version || '12.1.2' }}
+  GRADLE_VERSION: '8.14'
+
+jobs:
+  # One job per Ghidra os/<platform> directory. Each builds Luau and the JNI
+  # bridge from source and uploads the one shared library it produced; the
+  # package job collects them into a single extension zip.
+  native:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: mac_arm_64
+            runner: macos-14
+            cmake_args: '-DCMAKE_OSX_ARCHITECTURES=arm64;-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0'
+          - platform: mac_x86_64
+            runner: macos-14
+            cmake_args: '-DCMAKE_OSX_ARCHITECTURES=x86_64;-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0'
+          - platform: linux_x86_64
+            runner: ubuntu-22.04
+          - platform: linux_arm_64
+            runner: ubuntu-22.04-arm
+          - platform: win_x86_64
+            runner: windows-2022
+            generator: 'Visual Studio 17 2022'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Ninja
+        if: matrix.generator == ''
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            brew install ninja
+          else
+            sudo apt-get update && sudo apt-get install -y ninja-build
+          fi
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Build native bridge
+        shell: bash
+        run: |
+          gradle --no-daemon stageBridgeNative \
+            "-PnativePlatform=${{ matrix.platform }}" \
+            "-PcmakeGenerator=${{ matrix.generator || 'Ninja' }}" \
+            "-PcmakeArgs=${{ matrix.cmake_args }}"
+
+      - name: Show result
+        shell: bash
+        run: ls -l "os/${{ matrix.platform }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.platform }}
+          path: os/${{ matrix.platform }}
+          if-no-files-found: error
+
+  package:
+    name: Package extension
+    needs: native
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Collect native libraries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: native-artifacts
+
+      - name: Stage native libraries into os/
+        run: |
+          for dir in native-artifacts/native-*; do
+            platform="${dir##*/native-}"
+            mkdir -p "os/$platform"
+            cp -v "$dir"/* "os/$platform/"
+          done
+
+      - name: Cache Ghidra
+        id: ghidra-cache
+        uses: actions/cache@v4
+        with:
+          path: ghidra-install
+          key: ghidra-${{ env.GHIDRA_VERSION }}
+
+      - name: Download Ghidra
+        if: steps.ghidra-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          url=$(gh api repos/NationalSecurityAgency/ghidra/releases --paginate \
+            --jq "[.[].assets[] | select(.name | startswith(\"ghidra_${GHIDRA_VERSION}_PUBLIC_\")) | .browser_download_url] | first")
+          if [ -z "$url" ] || [ "$url" = null ]; then
+            echo "No public Ghidra release found for version ${GHIDRA_VERSION}" >&2
+            exit 1
+          fi
+          echo "Downloading $url"
+          curl -fsSL -o ghidra.zip "$url"
+          mkdir -p ghidra-install
+          unzip -q ghidra.zip -d ghidra-install
+          rm ghidra.zip
+
+      - name: Locate Ghidra
+        run: |
+          install_dir=$(find "$PWD/ghidra-install" -maxdepth 1 -type d -name 'ghidra_*_PUBLIC' | head -1)
+          if [ -z "$install_dir" ]; then
+            echo "Ghidra installation not found under ghidra-install" >&2
+            exit 1
+          fi
+          echo "GHIDRA_INSTALL_DIR=$install_dir" >> "$GITHUB_ENV"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      # Smoke test: proves the library built by the linux_x86_64 job actually
+      # loads and runs the suite before anything is published.
+      - name: Run Luau test suite
+        run: gradle --no-daemon luaTest -PskipLuauNative=true
+
+      - name: Build extension
+        run: gradle --no-daemon buildExtension -PskipLuauNative=true
+
+      - name: Verify every platform is in the zip
+        run: |
+          zip=$(ls dist/*.zip)
+          echo "Built $zip"
+          for platform in mac_arm_64 mac_x86_64 linux_x86_64 linux_arm_64 win_x86_64; do
+            unzip -l "$zip" | grep -q "os/$platform/" \
+              || { echo "missing os/$platform in $zip" >&2; exit 1; }
+          done
+          unzip -l "$zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LuaGhidra-extension
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.zip \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag
