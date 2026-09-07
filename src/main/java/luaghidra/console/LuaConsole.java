@@ -61,7 +61,11 @@ public final class LuaConsole implements Disposable {
 			new BufferedReader(new InputStreamReader(console.getStdin(), StandardCharsets.UTF_8));
 		this.out = console.getOutWriter();
 		this.err = console.getErrWriter();
-		this.state = new GhidraState(tool, project, null, null, null, null);
+		// The copy constructor yields a non-global state: it tracks the tool's
+		// program, cursor, and selection without re-firing plugin events back
+		// into the tool (which would echo every navigation, and throws when the
+		// tool clears the location on close).
+		this.state = new GhidraState(new GhidraState(tool, project, null, null, null, null));
 	}
 
 	/** Points the console at the tool's active program. */
